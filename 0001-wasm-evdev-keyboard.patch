@@ -1,0 +1,138 @@
+--- a/kdrive/linux/keyboard.c
++++ b/kdrive/linux/keyboard.c
+@@ -32,6 +32,12 @@
+ #include <X11/keysym.h>
+ #include <termios.h>
+ #include <sys/ioctl.h>
++#ifdef __wasm__
++#include <errno.h>
++#include <fcntl.h>
++#include <string.h>
++#include <unistd.h>
++#endif
+ 
+ extern int LinuxConsoleFd;
+ 
+@@ -375,8 +381,61 @@
+ 	readKernelMapping();
+ }
+ 
++#ifdef __wasm__
++/* virtio-input uses the 32-bit Linux input_event ABI in this guest.
++ * The pointer and keyboard open independent evdev clients on event0. */
++#define WASM_EV_KEY 0x01
++struct wasm_keyboard_event {
++	long tv_sec;
++	long tv_usec;
++	unsigned short type;
++	unsigned short code;
++	int value;
++};
++_Static_assert(sizeof(struct wasm_keyboard_event) == 16,
++	       "unexpected wasm32 input_event layout");
++
++static int WasmKeyboardFd = -1;
++static unsigned char WasmKeyboardPartial[sizeof(struct wasm_keyboard_event)];
++static size_t WasmKeyboardPartialSize;
++#endif
++
+ static void LinuxKeyboardRead(int fd, void *closure)
+ {
++#ifdef __wasm__
++	if (fd == WasmKeyboardFd) {
++		unsigned char buf[256];
++		ssize_t n;
++		size_t i;
++		struct wasm_keyboard_event ev;
++
++		(void)closure;
++		for (;;) {
++			n = read(fd, buf, sizeof(buf));
++			if (n < 0) {
++				if (errno == EINTR)
++					continue;
++				if (errno != EAGAIN && errno != EWOULDBLOCK)
++					ErrorF("evdev keyboard read failed: %s\n", strerror(errno));
++				break;
++			}
++			if (n == 0)
++				break;
++			for (i = 0; i < (size_t)n; ++i) {
++				WasmKeyboardPartial[WasmKeyboardPartialSize++] = buf[i];
++				if (WasmKeyboardPartialSize != sizeof(ev))
++					continue;
++				memcpy(&ev, WasmKeyboardPartial, sizeof(ev));
++				WasmKeyboardPartialSize = 0;
++				if (ev.type == WASM_EV_KEY && ev.code < 256 &&
++				    (ev.value == 0 || ev.value == 1 || ev.value == 2))
++					KdEnqueueKeyboardEvent((unsigned char)ev.code,
++							       ev.value == 0);
++			}
++		}
++		return;
++	}
++#endif
+ 	unsigned char buf[256], *b;
+ 	int n;
+ 
+@@ -395,6 +454,10 @@
+ 
+ static int LinuxKeyboardEnable(int fd, void *closure)
+ {
++#ifdef __wasm__
++	if (fd == WasmKeyboardFd)
++		return fd;
++#endif
+ 	struct termios nTty;
+ 	unsigned char buf[256];
+ 	int n;
+@@ -422,6 +485,10 @@
+ 
+ static void LinuxKeyboardDisable(int fd, void *closure)
+ {
++#ifdef __wasm__
++	if (fd == WasmKeyboardFd)
++		return;
++#endif
+ 	ioctl(LinuxConsoleFd, KDSKBMODE, LinuxKbdTrans);
+ 	tcsetattr(LinuxConsoleFd, TCSANOW, &LinuxTermios);
+ }
+@@ -431,6 +498,22 @@
+ 	if (!LinuxKbdType)
+ 		LinuxKbdType = KdAllocInputType();
+ 
++#ifdef __wasm__
++	WasmKeyboardFd = open("/dev/input/event0", O_RDONLY | O_NONBLOCK);
++	if (WasmKeyboardFd >= 0) {
++		if (KdRegisterFd(LinuxKbdType, WasmKeyboardFd,
++				 LinuxKeyboardRead, 0)) {
++			WasmKeyboardPartialSize = 0;
++			KdRegisterFdEnableDisable(WasmKeyboardFd,
++				LinuxKeyboardEnable, LinuxKeyboardDisable);
++			ErrorF("Using evdev keyboard /dev/input/event0\n");
++			return 1;
++		}
++		close(WasmKeyboardFd);
++		WasmKeyboardFd = -1;
++	}
++	ErrorF("evdev keyboard unavailable; falling back to VT input\n");
++#endif
+ 	KdRegisterFd(LinuxKbdType, LinuxConsoleFd, LinuxKeyboardRead, 0);
+ 	LinuxKeyboardEnable(LinuxConsoleFd, 0);
+ 	KdRegisterFdEnableDisable(LinuxConsoleFd,
+@@ -440,6 +523,15 @@
+ 
+ static void LinuxKeyboardFini(void)
+ {
++#ifdef __wasm__
++	if (WasmKeyboardFd >= 0) {
++		KdUnregisterFds(LinuxKbdType, FALSE);
++		close(WasmKeyboardFd);
++		WasmKeyboardFd = -1;
++		WasmKeyboardPartialSize = 0;
++		return;
++	}
++#endif
+ 	LinuxKeyboardDisable(LinuxConsoleFd, 0);
+ 	KdUnregisterFds(LinuxKbdType, FALSE);
+ }
